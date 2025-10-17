@@ -1,5 +1,6 @@
 import os
 import cv2
+import json
 import numpy as np
 import mindspore
 from mindspore import nn
@@ -8,89 +9,99 @@ from mindspore import dtype as mstype
 from mindspore.train import Model
 from mindspore.train.callback import LossMonitor, TimeMonitor
 from mindspore.dataset import GeneratorDataset
-import pycocotools.coco as coco
-import mindspore.ops as ops
-import mindspore.dataset as ds
-
 from PoseTransformer import MediaPipePoseEstimator, PoseTransformer
 
+# 视频标签数据存储路径
+VIDEO_PATH = 'path_to_your_video_directory'
+LABELS_PATH = 'path_to_your_label_jsons'
 
 
-# COCO Dataset Loader for Pose Estimation
-class CocoPoseDataset:
-    def __init__(self, coco_annotation_file, image_dir, pose_estimator):
-        self.coco = coco.COCO(coco_annotation_file)
-        self.image_dir = image_dir
+# 视频帧与标签数据提取器
+class VideoPoseDataset:
+    def __init__(self, video_path, labels_path, pose_estimator):
+        self.video_path = video_path
+        self.labels_path = labels_path
         self.pose_estimator = pose_estimator
-
-        self.image_ids = self.coco.getImgIds()
-        self.image_data = []
+        self.video_data = []
         self.labels = []
-
         self.prepare_data()
 
     def prepare_data(self):
-        for image_id in self.image_ids:
-            image_info = self.coco.loadImgs(image_id)[0]
-            img_path = os.path.join(self.image_dir, image_info['file_name'])
-            img = cv2.imread(img_path)
-            if img is None:
-                continue
+        # 加载所有视频文件
+        video_files = [f for f in os.listdir(self.video_path) if f.endswith('.mp4')]
 
-            skeleton = self.pose_estimator.extract_skeleton(img)
-            if skeleton is None or skeleton.shape[0] != 33:
-                continue  # Skip if skeleton is not valid
+        for video_file in video_files:
+            # 读取标签
+            label_file = os.path.join(self.labels_path, video_file.replace('.mp4', '.json'))
+            with open(label_file, 'r') as f:
+                video_labels = json.load(f)
 
-            # Normalize the skeleton points between 0 and 1
-            skeleton /= np.array([img.shape[1], img.shape[0]])  # Normalize by width and height
-            self.image_data.append(skeleton)
+            # 读取视频并提取骨架数据
+            video_path = os.path.join(self.video_path, video_file)
+            cap = cv2.VideoCapture(video_path)
+            frame_id = 0
 
-            # We can choose the 'keypoints' annotation for the labels
-            annotations = self.coco.loadAnns(self.coco.getAnnIds(imgIds=image_id))
-            keypoints = []
-            for annotation in annotations:
-                keypoints.append(annotation['keypoints'])
-            self.labels.append(keypoints)
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break  # 视频读取完毕
+
+                # 提取骨架数据
+                skeleton = self.pose_estimator.extract_skeleton(frame)
+                if skeleton is None or skeleton.shape[0] != 33:
+                    continue  # 跳过无效骨架数据
+
+                # 标准化骨架数据
+                skeleton /= np.array([frame.shape[1], frame.shape[0]])  # 归一化
+
+                # 获取当前帧的标签
+                current_label = next(item for item in video_labels["frames"] if item["frame_id"] == frame_id)
+                keypoints = current_label["keypoints"]
+                action_type = current_label["action_type"]
+
+                # 将骨架和标签加入数据集
+                self.video_data.append(skeleton)
+                self.labels.append({"keypoints": keypoints, "action_type": action_type})
+                frame_id += 1
+            cap.release()
 
     def __getitem__(self, index):
-        return self.image_data[index], self.labels[index]
+        return self.video_data[index], self.labels[index]
 
     def __len__(self):
-        return len(self.image_data)
+        return len(self.video_data)
 
 
-# Example usage with COCO dataset
+# 训练模型
 if __name__ == "__main__":
-    # Initialize MediaPipe Pose Estimator
+    # 初始化 MediaPipe Pose Estimator
     pose_estimator = MediaPipePoseEstimator()
 
-    # Load COCO Dataset
-    coco_annotation_file = 'path_to_coco_annotations.json'  # Path to COCO annotations
-    image_dir = 'path_to_coco_images'  # Path to COCO images directory
-    coco_dataset = CocoPoseDataset(coco_annotation_file, image_dir, pose_estimator)
+    # 加载视频数据和标签
+    dataset = VideoPoseDataset('path_to_your_video_directory', 'path_to_your_label_jsons', pose_estimator)
 
-    # Prepare MindSpore Model
+    # 准备 MindSpore 模型
     model = PoseTransformer(cnn_out_channels=64, embed_dim=128, num_heads=4, num_layers=2)
 
-    # Loss and Optimizer
+    # 损失函数和优化器
     loss_fn = nn.SoftmaxCrossEntropyWithLogits(sparse=True, reduction="mean")
     optimizer = nn.Adam(model.trainable_params(), learning_rate=0.001)
 
-    # Train Data
-    dataset = GeneratorDataset(coco_dataset, ["skeleton", "label"])
-    dataset = dataset.batch(32)
+    # 创建数据集
+    mindspore_dataset = GeneratorDataset(dataset, ["skeleton", "label"])
+    mindspore_dataset = mindspore_dataset.batch(32)
 
-    # Model Training Loop
+    # 训练过程
     loss_monitor = LossMonitor(per_print_times=10)
-    time_monitor = TimeMonitor(data_size=dataset.get_dataset_size())
+    time_monitor = TimeMonitor(data_size=mindspore_dataset.get_dataset_size())
 
-    # Start Training
+    # 训练模型
     model_with_loss = nn.WithLossCell(model, loss_fn)
     train_net = nn.TrainOneStepCell(model_with_loss, optimizer)
 
     model = Model(train_net)
-    model.train(epochs=10, train_dataset=dataset, callbacks=[loss_monitor, time_monitor])
+    model.train(epochs=10, train_dataset=mindspore_dataset, callbacks=[loss_monitor, time_monitor])
 
-    # Save model
+    # 保存模型
     mindspore.save_checkpoint(model, 'pose_transformer_model.ckpt')
-    print("Model saved successfully!")
+    print("Model checkpoint saved successfully!")
