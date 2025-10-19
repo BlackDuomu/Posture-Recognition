@@ -1,19 +1,19 @@
 # data/dataset.py
-from torch.utils.data import Dataset, DataLoader
 import numpy as np
-import torch
 
-class PoseDataset(Dataset):
-    def __init__(self, keypoints_path, labels_path):
-        self.keypoints = np.load(keypoints_path)  # 加载骨架数据
-        self.labels = np.load(labels_path)  # 加载标签数据
+def load_keypoints_and_labels():
+    # 假设你的视频文件命名为 video_1.mp4, video_2.mp4, video_3.mp4
+    video_files = ['video_1.mp4', 'video_2.mp4', 'video_3.mp4']  # 需要与你的实际视频文件匹配
+    keypoints = [np.load(f'keypoints/{video_name.split(".")[0]}_keypoints.npy') for video_name in video_files]
+    labels = np.load('labels/labels.npy')  # 加载标签数据
 
-    def __len__(self):
-        return len(self.keypoints)
+    # 确保每个视频的骨架数据和标签一一对应
+    for i in range(len(keypoints)):
+        print(f"Video {i+1}:")
+        print(f"  Keypoints shape: {keypoints[i].shape}")
+        print(f"  Label: {labels[i]}")
 
-    def __getitem__(self, idx):
-        return torch.tensor(self.keypoints[idx], dtype=torch.float32), torch.tensor(self.labels[idx], dtype=torch.long)
+    return keypoints, labels
 
-def create_data_loader(keypoints_path, labels_path, batch_size=32):
-    dataset = PoseDataset(keypoints_path, labels_path)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+# 调用函数以加载数据
+keypoints, labels = load_keypoints_and_labels()

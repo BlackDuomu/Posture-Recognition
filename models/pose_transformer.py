@@ -7,8 +7,6 @@ class PoseTransformer(nn.Module):
     def __init__(self, num_heads=8, num_layers=6, input_dim=33, seq_len=100):
         super(PoseTransformer, self).__init__()
 
-        # 输入维度为 33，代表一个姿态中的33个关键点（每个关键点有x, y, z坐标）
-        # 假设输入序列长度为100（即100帧数据）
         self.input_dim = input_dim
         self.seq_len = seq_len
 
