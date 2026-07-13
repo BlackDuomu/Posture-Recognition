@@ -1,0 +1,42 @@
+# Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments and secrets
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Runtime files
+outputs/
+uploads/
+inference_output/
+debug_output/
+*.log
+data/**/.cache_pose/
+*.npz
+
+# Do not add new model weights, datasets, or user videos. Existing tracked
+# fixtures/weights remain tracked; .gitignore does not remove them.
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.pkl
+*.avi
+*.mov
+*.mkv
+data/videos/*.mp4
+
+# Editors and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
