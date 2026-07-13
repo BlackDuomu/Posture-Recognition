@@ -130,7 +130,7 @@ def main():
     parser = argparse.ArgumentParser(description="Verify Dynamic Segmentation and Alignment across Multi-channels")
     parser.add_argument('--csv', default=None, help="Path to IMU CSV file (Optional)")
     parser.add_argument('--cam-a', default=None, help="Path to CamA video file (Optional)")
-    parser.add_argument('--cam-b', default='/home/yezi/Desktop/Professions/BJUT/Posture-Recognition/data_utils/datas/tests/20260702142802.mp4', help="Path to CamB video file (Optional)")
+    parser.add_argument('--cam-b', default=None, help="Path to CamB video file (Optional)")
     parser.add_argument('--output-dir', default='debug_output', help="Directory to save plots and video clips")
 
     # 拓扑微调参数
