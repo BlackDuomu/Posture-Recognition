@@ -338,8 +338,22 @@ def extract_imu(csv_path: Path) -> Tuple[np.ndarray, np.ndarray, Dict]:
     df.columns = [str(c).strip() for c in df.columns]
     cleaned = {clean_column(c): c for c in df.columns}
     cols = []
-    for _, keys in IMU_FEATURE_KEYWORDS:
-        found = next((cleaned[k] for k in cleaned for key in keys if key in k), None)
+    for canonical_name, keys in IMU_FEATURE_KEYWORDS:
+        canonical_key = clean_column(canonical_name)
+        alias_keys = [clean_column(key) for key in keys]
+        found = cleaned.get(canonical_key)
+        if found is None:
+            found = next((cleaned[key] for key in alias_keys if key in cleaned), None)
+        if found is None:
+            found = next(
+                (
+                    original
+                    for cleaned_name, original in cleaned.items()
+                    for alias in sorted(alias_keys, key=len, reverse=True)
+                    if alias and alias in cleaned_name
+                ),
+                None,
+            )
         cols.append(found)
     warnings = []
     if any(c is None for c in cols):
@@ -596,9 +610,10 @@ def build_dataset(args: argparse.Namespace) -> Tuple[List[Dict], Dict]:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Generate formal tennis posture dataset with modal-adaptive alignment")
-    p.add_argument("--data-dir", default="/home/yezi/Desktop/Professions/BJUT/Posture-Recognition/data_utils/datas")
-    p.add_argument("--output", default="/home/yezi/Desktop/Professions/BJUT/Posture-Recognition/data_utils/tennis_dataset_v1.pkl")
-    p.add_argument("--summary", default="/home/yezi/Desktop/Professions/BJUT/Posture-Recognition/data_utils/tennis_dataset_summary.json")
+    project_root = Path(__file__).resolve().parents[1]
+    p.add_argument("--data-dir", default=str(project_root / "data_utils" / "datas"))
+    p.add_argument("--output", default=str(project_root / "outputs" / "tennis_dataset_v1.pkl"))
+    p.add_argument("--summary", default=str(project_root / "outputs" / "tennis_dataset_summary.json"))
     p.add_argument("--imu-len", type=int, default=100)
     p.add_argument("--pose-len", type=int, default=50)
     p.add_argument("--max-width", type=int, default=640)
