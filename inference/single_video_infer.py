@@ -557,6 +557,17 @@ def detect_synthetic_imu(csv_path: str | Path) -> bool:
     return False
 
 
+def _normalized_video_fps(value: float) -> float:
+    """Return a codec-safe FPS value from OpenCV metadata."""
+
+    fps = float(value) or 30.0
+    # Some phone recordings expose their stream time-base (for example 90,000)
+    # as FPS through OpenCV. MPEG-4 cannot encode such a value.
+    if not np.isfinite(fps) or fps <= 0 or fps > 240:
+        return 30.0
+    return fps
+
+
 def export_video_segment(
     video_path: Path,
     start_frame: int,
@@ -569,9 +580,7 @@ def export_video_segment(
     try:
         if not cap.isOpened():
             raise ClipExportError("Unable to open source video for clip export")
-        fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
-        if not np.isfinite(fps) or fps <= 0:
-            fps = 30.0
+        fps = _normalized_video_fps(cap.get(cv2.CAP_PROP_FPS))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         if width <= 0 or height <= 0:
@@ -627,9 +636,8 @@ def _validate_video(video_path: Path | None) -> float:
         fps = float(cap.get(cv2.CAP_PROP_FPS))
     finally:
         cap.release()
-    if not np.isfinite(fps) or fps <= 0:
-        fps = 30.0
-    return fps
+    # Keep the segmenting clock consistent with clip export.
+    return _normalized_video_fps(fps)
 
 
 def _validate_imu_csv(csv_path: Path | None) -> None:
