@@ -13,7 +13,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from data_utils.dataset_generator import extract_imu, extract_pose, resample_sequence, fallback_segments
+from data_utils.dataset_generator import extract_imu, extract_pose, resample_sequence, fallback_segments, compute_auto_alignment_offset
 from models.model import TennisMultimodalTransformer
 
 
@@ -289,15 +289,34 @@ def main():
             print("   ⚠️ 提示：缺省 Cam A。")
             pose_a = None
 
-    # C. 动作片段对齐映射决策
     final_segments = []  # 格式：[(imu_start, imu_end, cam_start, cam_end), ...]
 
+    scale_factor = 1.0
+    offset_ratio = 0.0
+
+    if has_imu and has_video:
+        ref_video_path = args.cam_a if has_cam_a else args.cam_b
+        cap = cv2.VideoCapture(str(ref_video_path))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+        if fps == 0 or np.isnan(fps):
+            fps = 30.0
+
+        ref_energy = energy_a if has_cam_a else energy_b
+        print("🔄 [自动对齐引擎] 正在计算 IMU 与视频之间的双锚点仿射偏置...")
+        scale_factor, offset_ratio = compute_auto_alignment_offset(imu_energy, ref_energy, fps)
+
     if has_imu:
-        # 有 IMU 时以 IMU 相对时间比例强行映射至相机序列
+        # 有 IMU 时以 IMU 相对时间比例加上对齐参数映射至相机序列
         for s, e in imu_segments:
-            rs, re_ = s / max(len(imu_vals), 1), e / max(len(imu_vals), 1)
-            va0 = int(rs * len(pose_a)) if has_cam_a else int(rs * len(pose_b)) if has_cam_b else 0
-            va1 = int(max(rs * len(pose_a) + 1, re_ * len(pose_a))) if has_cam_a else int(max(rs * len(pose_b) + 1, re_ * len(pose_b))) if has_cam_b else 0
+            rs = scale_factor * (s / max(len(imu_vals), 1)) + offset_ratio
+            re_ = scale_factor * (e / max(len(imu_vals), 1)) + offset_ratio
+            rs = max(0.0, min(1.0, rs))
+            re_ = max(0.0, min(1.0, re_))
+
+            ref_len = len(pose_a) if has_cam_a else len(pose_b) if has_cam_b else 0
+            va0 = int(rs * ref_len)
+            va1 = int(max(rs * ref_len + 1, re_ * ref_len))
             final_segments.append((s, e, va0, va1))
     else:
         # 纯视觉时：执行全新拓扑自适应波峰合并算法
@@ -345,40 +364,86 @@ def main():
         if has_video:
             if pose_a is not None:
                 pose_a_raw = resample_sequence(pose_a[vs_:ve_], 50, (33, 3))
-                # 💡 直接保留原始骨架 (1, 50, 33, 3)，模型内部会自动展平成 99 维
+                # 直接保留原始骨架 (1, 50, 33, 3)，模型内部会自动展平成 99 维
                 pose_a_tensor = torch.as_tensor(pose_a_raw, dtype=torch.float32).unsqueeze(0).to(device)
             else:
-                # 💡 缺省时，将占位全零张量的形状也改回原始 3D 骨架形状 (1, 50, 33, 3)
+                # 缺省时，将占位全零张量的形状也改回原始 3D 骨架形状 (1, 50, 33, 3)
                 pose_a_tensor = torch.zeros((1, 50, 33, 3), dtype=torch.float32).to(device)
 
             if pose_b is not None:
                 pose_b_raw = resample_sequence(pose_b[vs_:ve_], 50, (33, 3))
-                # 💡 直接保留原始骨架 (1, 50, 33, 3)
+                # 直接保留原始骨架 (1, 50, 33, 3)
                 pose_b_tensor = torch.as_tensor(pose_b_raw, dtype=torch.float32).unsqueeze(0).to(device)
             else:
-                # 💡 缺省时，将占位全零张量的形状也改回原始 3D 骨架形状 (1, 50, 33, 3)
+                # 缺省时，将占位全零张量的形状也改回原始 3D 骨架形状 (1, 50, 33, 3)
                 pose_b_tensor = torch.zeros((1, 50, 33, 3), dtype=torch.float32).to(device)
 
         # 模型前向推理
         with torch.no_grad():
-            outputs = model(imu_tensor, pose_a_tensor, pose_b_tensor)
+            hand_tensor = torch.tensor([0], dtype=torch.long).to(device)  # 1表示左撇子
+            backhand_tensor = torch.tensor([0], dtype=torch.long).to(device)  # 1表示单反
+            ntrp_tensor = torch.tensor([[4]], dtype=torch.float32).to(device)  # 2.5分
+
+            outputs = model(
+                imu_tensor,
+                pose_a_tensor,
+                pose_b_tensor,
+                hand_idx=hand_tensor,
+                backhand_idx=backhand_tensor,
+                ntrp_val=ntrp_tensor
+            )
 
             if hierarchical:
-                prob_major = torch.softmax(outputs['major'], dim=1)
-                prob_action = torch.softmax(outputs['action'], dim=1)
-                prob_quality = torch.softmax(outputs['quality'], dim=1)
+                prob_major_2d = torch.softmax(outputs['major'], dim=1)
+                prob_action_2d = torch.softmax(outputs['action'], dim=1)
+                prob_quality_2d = torch.softmax(outputs['quality'], dim=1)
 
-                conf_major, idx_major = prob_major.max(dim=1)
-                conf_action, idx_action = prob_action.max(dim=1)
-                conf_quality, idx_quality = prob_quality.max(dim=1)
+                conf_major, idx_major = prob_major_2d.max(dim=1)
+                conf_action, idx_action = prob_action_2d.max(dim=1)
+                conf_quality, idx_quality = prob_quality_2d.max(dim=1)
 
-                # OSR 置信度门槛判定过滤
-                pred_major_str = major_map.get(idx_major.item(), "其他") if conf_major.item() >= args.conf_threshold else "未知大类"
-                pred_action_str = action_map.get(idx_action.item(), "其他") if conf_action.item() >= args.conf_threshold else "未知小类"
-                pred_quality_str = quality_map.get(idx_quality.item(), "其他") if conf_quality.item() >= args.conf_threshold else "未知姿态"
+                prob_major = prob_major_2d[0].cpu().numpy()
+                prob_action = prob_action_2d[0].cpu().numpy()
+                prob_quality = prob_quality_2d[0].cpu().numpy()
 
-                print(f"🎬 片段 #{idx:02d} | 类别：{pred_major_str} -> {pred_action_str} | 状态：{pred_quality_str} "
-                      f"| 置信度：[大类:{conf_major.item():.1%}, 小类:{conf_action.item():.1%}, 纠错:{conf_quality.item():.1%}]")
+                major_dist = sorted(
+                    {major_map[i]: float(prob) for i, prob in enumerate(prob_major)}.items(),
+                    key=lambda x: x[1], reverse=True
+                )
+                action_dist = sorted(
+                    {action_map[i]: float(prob) for i, prob in enumerate(prob_action)}.items(),
+                    key=lambda x: x[1], reverse=True
+                )
+                quality_dist = sorted(
+                    {quality_map[i]: float(prob) for i, prob in enumerate(prob_quality)}.items(),
+                    key=lambda x: x[1], reverse=True
+                )
+
+                # 提取置信度最高的结果用于终端快速打印和安全文件名生成
+                pred_major_str = major_dist[0][0] if major_dist[0][1] >= args.conf_threshold else "未知大类"
+                pred_action_str = action_dist[0][0] if action_dist[0][1] >= args.conf_threshold else "未知小类"
+                pred_quality_str = quality_dist[0][0] if quality_dist[0][1] >= args.conf_threshold else "未知姿态"
+
+                print(f"🎬 片段 #{idx:02d} | 预测：{pred_major_str} -> {pred_action_str} | 最可能状态：{pred_quality_str}")
+
+                # 组装成标准的结构化 JSON 数据，用于直接喂给 LLM Agent
+                segment_report = {
+                    "segment_id": idx,
+                    "timestamps": {
+                        "video_start_frame": int(vs_),
+                        "video_end_frame": int(ve_)
+                    },
+                    "predictions": {
+                        "major_stroke_category": [{"class": k, "probability": f"{v:.2%}"} for k, v in major_dist],
+                        "detailed_action_type": [{"class": k, "probability": f"{v:.2%}"} for k, v in action_dist],
+                        "movement_quality_feedback": [{"class": k, "probability": f"{v:.2%}"} for k, v in quality_dist]
+                    }
+                }
+
+                import json
+                print("📝 [LLM 智能体数据载荷 (JSON Payload)]:")
+                print(json.dumps(segment_report, ensure_ascii=False, indent=2))
+                print("=" * 80)
 
                 # ==================== 新增：自动视频切片导出逻辑 ====================
                 if has_video:
@@ -402,7 +467,6 @@ def main():
                     if has_cam_b:
                         out_path_b = os.path.join(args.output_dir, f"CamB_{safe_filename}")
                         export_video_segment(args.cam_b, vs_, ve_, out_path_b)
-                # ====================================================================
             else:
                 probs = torch.softmax(outputs, dim=1)
                 conf, pred_class = probs.max(dim=1)

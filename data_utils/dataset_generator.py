@@ -46,25 +46,37 @@ def normalize_skeleton(pose):
     return pose_normalized.reshape(pose.shape[0], -1).astype(np.float32)  # (T, 99)
 
 
-def compute_auto_alignment_offset(imu_energy: np.ndarray, video_energy: np.ndarray, fps: float) -> Tuple[float, float]:
-    x_imu = np.linspace(0, 1, len(imu_energy))
-    x_vid = np.linspace(0, 1, len(video_energy))
-    imu_resampled = np.interp(x_vid, x_imu, imu_energy)
+def compute_auto_alignment_offset(imu_energy, video_energy, fps):
+    """
+    💡 双锚点仿射对齐算法 (Two-Anchor Affine Time Alignment)
+    计算并返回缩放因子(scale)和时序偏置(offset)，彻底解决因录制总时长不同而导致的时序累积漂移问题。
+    """
+    min_dist_frames = max(5, int(1.5 * fps))
+    imu_fps = len(imu_energy) / (len(video_energy) / fps)
+    min_dist_imu = max(5, int(1.5 * imu_fps))
 
-    imu_norm = (imu_resampled - np.mean(imu_resampled)) / (np.std(imu_resampled) + 1e-6)
-    vid_norm = (video_energy - np.mean(video_energy)) / (np.std(video_energy) + 1e-6)
+    imu_peaks_raw, _ = scipy.signal.find_peaks(imu_energy / (np.max(imu_energy) + 1e-6), height=0.35, distance=min_dist_imu)
+    vid_peaks_raw, _ = scipy.signal.find_peaks(video_energy / (np.max(video_energy) + 1e-6), height=0.35, distance=min_dist_frames)
 
-    correlation = scipy.signal.correlate(vid_norm, imu_norm, mode='full')
-    lags = scipy.signal.correlation_lags(len(vid_norm), len(imu_norm), mode='full')
+    t_imu = imu_peaks_raw / len(imu_energy)
+    t_vid = vid_peaks_raw / len(video_energy)
 
-    best_lag_idx = np.argmax(correlation)
-    best_lag_frames = lags[best_lag_idx]
+    if len(t_imu) < 2 or len(t_vid) < 2:
+        print("⚠️ 警告: 显著波峰过少，无法执行双点锚定，退回默认等比对准。")
+        return 1.0, 0.0
 
-    offset_ratio = best_lag_frames / len(video_energy)
+    # 锚点 1: 首个有效击球
+    t_i0, t_v0 = t_imu[0], t_vid[0]
+    # 锚点 2: 最后一个有效击球
+    t_i1, t_v1 = t_imu[-1], t_vid[-1]
 
-    print(f"      物理伸缩率 (Scale): 1.000000 | 物理对齐量 (Offset): {offset_ratio:.4%}")
+    # 解线性方程组，计算缩放因子 scale 和偏置量 offset
+    scale = (t_v1 - t_v0) / (t_i1 - t_i0 + 1e-9)
+    offset = t_v0 - scale * t_i0
 
-    return 1.0, offset_ratio
+    print(f"   ✅ [双锚点仿射引擎] 成功解得时序映射参数：")
+    print(f"      物理伸缩率 (Scale): {scale:.6f} | 物理对齐量 (Offset): {offset:.4%}")
+    return scale, offset
 
 
 def find_segments_by_imu_peaks(energy: np.ndarray, fs: float = 100.0) -> List[Tuple[int, int]]:
@@ -201,7 +213,7 @@ def find_action_segments_topological(energy: np.ndarray, fps: float, noise_floor
         drop_ratio = (shorter_peak_val - valley_val) / (shorter_peak_val + 1e-6)
         time_gap_seconds = (next_p - curr_p) / fps
 
-        if drop_ratio < 0.45 or time_gap_seconds < 0.75:
+        if drop_ratio < relative_drop or time_gap_seconds < 0.75:
             new_p = curr_p if norm_energy[curr_p] > norm_energy[next_p] else next_p
             peak_bounds[i] = [curr_l, next_r, new_p]
             peak_bounds.pop(i + 1)
@@ -308,29 +320,68 @@ def fallback_segments(length: int, count: int) -> List[Tuple[int, int]]:
     return [(int(edges[i]), int(max(edges[i] + 1, edges[i + 1]))) for i in range(count)]
 
 
-def parse_recording_id(recording_id: str) -> Tuple[Optional[str], int, int, int]:
+def parse_recording_id(recording_id: str) -> Tuple[Optional[str], int, int, int, str]:
+    """
+    解析文件名标识。
+    返回: (subject_id, major, action, quality, session_id)
+    """
     parts = recording_id.split("_")
-    if len(parts) == 3:
-        return None, int(parts[0]), int(parts[1]), int(parts[2])
-    if len(parts) == 4:
-        return parts[0], int(parts[1]), int(parts[2]), int(parts[3])
+
+    if len(parts) == 5:
+        return parts[1], int(parts[2]), int(parts[3]), int(parts[4]), parts[0]
+
+    elif len(parts) == 4:
+        return parts[0], int(parts[1]), int(parts[2]), int(parts[3]), "unknown_session"
+
+    elif len(parts) == 3:
+        return None, int(parts[0]), int(parts[1]), int(parts[2]), "unknown_session"
+
     raise ValueError(f"Unsupported recording id format: {recording_id}")
 
 
-def read_default_subject_id(data_dir: Path) -> Optional[str]:
+def read_subjects_metadata(data_dir: Path) -> dict:
+    """读取受试者特征元数据表格，返回 subject_id 到特征的映射字典"""
     candidates = list(data_dir.glob("*受试者*元数据*.xlsx")) + list(data_dir.glob("*subject*metadata*.xlsx"))
+    meta_dict = {}
+
     if not candidates:
-        return None
+        print("⚠️ 未找到受试者元数据表格，将使用全网球默认特征 (右手, 双反, NTRP 3.0)")
+        return meta_dict
+
     try:
         df = pd.read_excel(candidates[0])
         if df.empty:
-            return None
+            return meta_dict
+
+        # 智能正则匹配列名
         id_cols = [c for c in df.columns if re.search(r"subject|受试者|编号|id", str(c), re.I)]
-        col = id_cols[0] if id_cols else df.columns[0]
-        values = [str(v) for v in df[col].dropna().unique()]
-        return values[0] if len(values) == 1 else None
-    except Exception:
-        return None
+        hand_cols = [c for c in df.columns if re.search(r"惯用手|持拍|手", str(c), re.I)]
+        backhand_cols = [c for c in df.columns if re.search(r"反手|单双|类型", str(c), re.I)]
+        ntrp_cols = [c for c in df.columns if re.search(r"ntrp|等级|水平", str(c), re.I)]
+
+        id_col = id_cols[0] if id_cols else df.columns[0]
+
+        for _, row in df.iterrows():
+            subj_id = str(row[id_col]).strip() if pd.notna(row[id_col]) else "unknown"
+
+            # 解析具体数值，如果缺省则使用默认值
+            hand = str(row[hand_cols[0]]).strip() if hand_cols and pd.notna(row[hand_cols[0]]) else "右"
+            backhand = str(row[backhand_cols[0]]).strip() if backhand_cols and pd.notna(row[backhand_cols[0]]) else "双反"
+            try:
+                ntrp = float(row[ntrp_cols[0]]) if ntrp_cols and pd.notna(row[ntrp_cols[0]]) else 3.0
+            except:
+                ntrp = 3.0
+
+            meta_dict[subj_id] = {
+                "dominant_hand": hand,
+                "backhand_type": backhand,
+                "ntrp": ntrp
+            }
+        print(f"✅ 成功加载 {len(meta_dict)} 位受试者的先验元数据")
+    except Exception as e:
+        print(f"⚠️ 读取受试者元数据失败: {e}，将回退至默认特征")
+
+    return meta_dict
 
 
 def extract_imu(csv_path: Path) -> Tuple[np.ndarray, np.ndarray, Dict]:
@@ -432,7 +483,6 @@ def discover_recordings(data_dir: Path) -> Dict[str, Dict[str, Path]]:
 
             recs.setdefault(rid, {})["csv"] = imu_path
 
-    # 💡 扫描视频文件
     for mp4 in data_dir.glob("*.mp4"):
         if mp4.stem.lower().startswith("calibration"):
             continue
@@ -445,7 +495,8 @@ def discover_recordings(data_dir: Path) -> Dict[str, Dict[str, Path]]:
 
 def build_dataset(args: argparse.Namespace) -> Tuple[List[Dict], Dict]:
     data_dir = Path(args.data_dir)
-    default_subject = read_default_subject_id(data_dir)
+    subjects_meta = read_subjects_metadata(data_dir)
+    default_subject = list(subjects_meta.keys())[0] if subjects_meta else "unknown"
     recordings = discover_recordings(data_dir)
     dataset, rec_summaries, warnings = [], [], []
     cache_dir = data_dir / ".cache_pose"
@@ -453,8 +504,14 @@ def build_dataset(args: argparse.Namespace) -> Tuple[List[Dict], Dict]:
     for rid in sorted(recordings):
         files = recordings[rid]
         try:
-            sid_from_name, major, action, quality = parse_recording_id(rid)
+            sid_from_name, major, action, quality, session_id = parse_recording_id(rid)
             subject_id = sid_from_name or default_subject or "unknown"
+
+            meta = subjects_meta.get(subject_id, {
+                "dominant_hand": "右",
+                "backhand_type": "双反",
+                "ntrp": 3.0
+            })
 
             has_imu = "csv" in files
             has_cam_a = "cam_a" in files
@@ -558,7 +615,12 @@ def build_dataset(args: argparse.Namespace) -> Tuple[List[Dict], Dict]:
                 pose_b_seg = normalize_skeleton(pose_b_raw)
 
                 dataset.append({
-                    "sample_id": f"{rid}_hit{idx:03d}", "recording_id": rid, "subject_id": subject_id,
+                    "sample_id": f"{rid}_hit{idx:03d}", "recording_id": rid,
+                    "subject_id": subject_id,
+                    "session_id": session_id,  # <- 注入场次
+                    "dominant_hand": meta["dominant_hand"],  # <- 注入惯用手
+                    "backhand_type": meta["backhand_type"],  # <- 注入单双反
+                    "ntrp": meta["ntrp"],  # <- 注入水平等级
                     "major_label": major, "action_label": action, "quality_label": quality,
                     "is_correct": quality == 0, "imu": imu_seg, "pose_cam_a": pose_a_seg,
                     "pose_cam_b": pose_b_seg, "video": pose_a_seg, "label": quality,

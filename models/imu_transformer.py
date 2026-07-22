@@ -6,8 +6,7 @@ class IMUTransformerEncoder(nn.Module):
     def __init__(self, input_dim=9, seq_len=100, embed_dim=128, num_heads=4,
                  num_layers=2, dim_feedforward=256, dropout=0.1):
         super().__init__()
-        # 在 projection 之前加入 LayerNorm 稳定输入分布
-        self.input_norm = nn.LayerNorm(input_dim)
+        self.input_norm = nn.InstanceNorm1d(input_dim, affine=True)
         self.proj = nn.Linear(input_dim, embed_dim)
         self.pos_embedding = nn.Parameter(torch.zeros(1, seq_len, embed_dim))
         layer = nn.TransformerEncoderLayer(
@@ -18,7 +17,11 @@ class IMUTransformerEncoder(nn.Module):
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x):
-        x = self.input_norm(x)  # 率先进行通道内的特征归一化
+        # x shape: (B, T, C) -> e.g. (B, 100, 9)
+        x = x.transpose(1, 2)  # (B, C, T)
+        x = self.input_norm(x)
+        x = x.transpose(1, 2)  # (B, T, C)
+
         x = self.proj(x)
         x = x + self.pos_embedding[:, :x.size(1), :]
         x = self.encoder(x)

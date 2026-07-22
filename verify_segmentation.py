@@ -8,40 +8,8 @@ import numpy as np
 import pandas as pd
 import scipy.signal  # 需要使用 scipy 寻找波峰
 
-from data_utils.dataset_generator import extract_imu, extract_pose, find_segments_by_video_peaks, find_action_segments_topological
+from data_utils.dataset_generator import extract_imu, extract_pose, find_action_segments_topological, compute_auto_alignment_offset
 
-
-def compute_auto_alignment_offset(imu_energy, video_energy, fps):
-    """
-    💡 双锚点仿射对齐算法 (Two-Anchor Affine Time Alignment)
-    计算并返回缩放因子(scale)和时序偏置(offset)，彻底解决因录制总时长不同而导致的时序累积漂移问题。
-    """
-    min_dist_frames = max(5, int(1.5 * fps))
-    imu_fps = len(imu_energy) / (len(video_energy) / fps)
-    min_dist_imu = max(5, int(1.5 * imu_fps))
-
-    imu_peaks_raw, _ = scipy.signal.find_peaks(imu_energy / (np.max(imu_energy) + 1e-6), height=0.35, distance=min_dist_imu)
-    vid_peaks_raw, _ = scipy.signal.find_peaks(video_energy / (np.max(video_energy) + 1e-6), height=0.35, distance=min_dist_frames)
-
-    t_imu = imu_peaks_raw / len(imu_energy)
-    t_vid = vid_peaks_raw / len(video_energy)
-
-    if len(t_imu) < 2 or len(t_vid) < 2:
-        print("⚠️ 警告: 显著波峰过少，无法执行双点锚定，退回默认等比对准。")
-        return 1.0, 0.0
-
-    # 锚点 1: 首个有效击球
-    t_i0, t_v0 = t_imu[0], t_vid[0]
-    # 锚点 2: 最后一个有效击球
-    t_i1, t_v1 = t_imu[-1], t_vid[-1]
-
-    # 解线性方程组，计算缩放因子 scale 和偏置量 offset
-    scale = (t_v1 - t_v0) / (t_i1 - t_i0 + 1e-9)
-    offset = t_v0 - scale * t_i0
-
-    print(f"   ✅ [双锚点仿射引擎] 成功解得时序映射参数：")
-    print(f"      物理伸缩率 (Scale): {scale:.6f} | 物理对齐量 (Offset): {offset:.4%}")
-    return scale, offset
 
 def check_and_convert_imu_path(file_path):
     """
@@ -209,7 +177,11 @@ def main():
                                                        min_periods=1).mean().fillna(0).to_numpy()
 
         # 💡 执行新算法：拓扑自适应波峰合并
-        segments = find_segments_by_video_peaks(ref_energy_f, fps)
+        segments = find_action_segments_topological(
+            ref_energy_f, fps,
+            noise_floor=args.noise_floor,
+            relative_drop=args.relative_drop
+        )
         print(f"   -> [拓扑分割引擎] 成功定位到 {len(segments)} 个自成一体的击球动作！")
 
     # 4. 💡 核心：计算自动对齐时序偏置（Auto-Alignment via Cross-Correlation）
